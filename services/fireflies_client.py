@@ -77,8 +77,10 @@ class FirefliesClient:
             participants
             summary {
               overview
+              shorthand_bullet
               outline
               action_items
+              keywords
             }
           }
         }
@@ -137,8 +139,10 @@ class FirefliesClient:
             participants
             summary {
               overview
+              shorthand_bullet
               outline
               action_items
+              keywords
             }
           }
         }

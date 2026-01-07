@@ -463,6 +463,65 @@ class DealCloudClient:
             self._cache[cache_key] = []
             return []
     
+    def search_deals_by_name(self, deal_name: str) -> List[Dict[str, Any]]:
+        """
+        Search for deals by name using contains/like matching.
+        Used to find deals like "Project Rubicon" from call titles.
+        
+        Args:
+            deal_name: Deal/project name to search for
+            
+        Returns:
+            List of matching deals
+        """
+        if not deal_name:
+            return []
+        
+        cache_key = f"deals_name:{deal_name.lower()}"
+        if cache_key in self._cache:
+            logger.debug(f"Using cached deal search for name: {deal_name}")
+            return self._cache[cache_key]
+        
+        self._delay()
+        
+        logger.deal(f"Searching deals by name: {deal_name}")
+        
+        try:
+            # Use $contains operator for partial matching
+            response = self.session.get(
+                url=f"{self.base_url}/api/rest/v4/data/entrydata/rows/deal",
+                params={
+                    "wrapIntoArrays": "true",
+                    "query": json.dumps({"DealName": {"$contains": deal_name}})
+                },
+                headers=self._get_headers(),
+                timeout=self.timeout
+            )
+            
+            if self._handle_rate_limit(response):
+                return self.search_deals_by_name(deal_name)  # Retry
+            
+            if not response.ok:
+                logger.warning(f"Deal name search error: {response.status_code}")
+                self._cache[cache_key] = []
+                return []
+            
+            data = response.json()
+            rows = data.get("rows", [])
+            
+            if rows:
+                logger.success(f"Found {len(rows)} deal(s) matching '{deal_name}'")
+            else:
+                logger.info(f"No deals found matching '{deal_name}'")
+            
+            self._cache[cache_key] = rows
+            return rows
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Deal name search failed: {str(e)}", e)
+            self._cache[cache_key] = []
+            return []
+    
     def test_connection(self) -> Dict[str, Any]:
         """
         Test API connection by authenticating.

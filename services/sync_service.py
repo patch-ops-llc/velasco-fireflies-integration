@@ -74,9 +74,47 @@ class SyncService:
             return None
         return email.split("@")[1].lower()
     
+    def extract_project_name(self, title: str) -> Optional[str]:
+        """
+        Extract project/deal name from call title.
+        
+        Common patterns:
+        - "Project Rubicon - SPP / Valesco Discussion" → "Project Rubicon"
+        - "Project Joy - S Group Capital Call" → "Project Joy"
+        - "Honey - Pro Forma EBITDA" → "Honey"
+        - "DME Opportunity: Valesco <> GCA" → None (no project name)
+        
+        Returns:
+            Project name if found, None otherwise
+        """
+        if not title:
+            return None
+        
+        import re
+        
+        # Pattern 1: "Project XYZ" anywhere in title
+        project_match = re.search(r'(Project\s+\w+)', title, re.IGNORECASE)
+        if project_match:
+            return project_match.group(1)
+        
+        # Pattern 2: Title starts with a code name followed by separator
+        # e.g., "Honey - Pro Forma EBITDA" or "Rubicon: Discussion"
+        # Look for word(s) before common separators like " - ", " : ", " / "
+        separator_match = re.match(r'^([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+)?)\s*[-:/<>]', title)
+        if separator_match:
+            potential_name = separator_match.group(1).strip()
+            # Filter out common non-project prefixes
+            skip_words = ['call', 'meeting', 'discussion', 'touchbase', 'catch', 'internal', 
+                          'weekly', 'daily', 'sync', 'update', 'review', 'valesco', 'team']
+            if potential_name.lower() not in skip_words:
+                return potential_name
+        
+        return None
+    
     def format_content(self, summary: Optional[Dict[str, Any]]) -> str:
         """
-        Format Fireflies summary, notes, and action items.
+        Format Fireflies summary, detailed notes, and action items.
+        Includes shorthand_bullet for detailed meeting notes.
         Does NOT include full transcript - only structured content.
         """
         if not summary:
@@ -84,15 +122,30 @@ class SyncService:
         
         sections = []
         
-        # Overview/Summary
+        # Overview/Summary (brief)
         overview = summary.get("overview")
         if overview:
             sections.append(f"SUMMARY:\n{overview}")
         
-        # Outline/Notes
+        # Keywords/Topics (if available)
+        keywords = summary.get("keywords")
+        if keywords and isinstance(keywords, list) and keywords:
+            keywords_text = ", ".join(keywords)
+            sections.append(f"KEY TOPICS:\n{keywords_text}")
+        
+        # Detailed Notes (shorthand_bullet) - This is the detailed content!
+        shorthand_bullet = summary.get("shorthand_bullet")
+        if shorthand_bullet:
+            sections.append(f"DETAILED NOTES:\n{shorthand_bullet}")
+        
+        # Outline/Notes (structured outline - fallback if no shorthand_bullet)
         outline = summary.get("outline")
         if outline:
-            sections.append(f"NOTES:\n{outline}")
+            # If we have shorthand_bullet, label this as outline, otherwise as notes
+            if shorthand_bullet:
+                sections.append(f"OUTLINE:\n{outline}")
+            else:
+                sections.append(f"NOTES:\n{outline}")
         
         # Action Items
         action_items = summary.get("action_items")
@@ -225,16 +278,19 @@ class SyncService:
                     reason="No company found and no existing contacts"
                 )
             
-            # Search for deals
+            # Search for deals - PRIORITY: Search by project name from title first
             deal_ids = []
             found_deals = []
             
-            if company_id:
-                logger.deal(f"Searching for deals by company ID: {company_id}")
-                deal_rows = dealcloud_client.search_deals_by_company(company_id)
+            # Step 1: Extract project name from call title and search by name
+            project_name = self.extract_project_name(title)
+            if project_name:
+                logger.deal(f"Extracted project name from title: '{project_name}'")
+                logger.deal(f"Searching for deals by project name...")
+                deal_rows = dealcloud_client.search_deals_by_name(project_name)
                 
                 if deal_rows:
-                    logger.success(f"Found {len(deal_rows)} deal(s)")
+                    logger.success(f"Found {len(deal_rows)} deal(s) matching project name")
                     for deal in deal_rows:
                         deal_id = deal.get("EntryId")
                         deal_name = deal.get("DealName", "Unknown")
@@ -245,9 +301,30 @@ class SyncService:
                                 "name": deal_name,
                                 "id": deal_id
                             })
-                            logger.deal(f"  {deal_name} [ID: {deal_id}]")
+                            logger.deal(f"  {deal_name} [ID: {deal_id}] (matched by project name)")
+            
+            # Step 2: If no deals found by name and we have a company, search by company as fallback
+            if not deal_ids and company_id:
+                logger.deal(f"No deals found by project name, searching by company ID: {company_id}")
+                deal_rows = dealcloud_client.search_deals_by_company(company_id)
+                
+                if deal_rows:
+                    logger.success(f"Found {len(deal_rows)} deal(s) by company")
+                    for deal in deal_rows:
+                        deal_id = deal.get("EntryId")
+                        deal_name = deal.get("DealName", "Unknown")
+                        
+                        if deal_id and deal_id not in deal_ids:
+                            deal_ids.append(deal_id)
+                            found_deals.append({
+                                "name": deal_name,
+                                "id": deal_id
+                            })
+                            logger.deal(f"  {deal_name} [ID: {deal_id}] (matched by company)")
                 else:
                     logger.info("No deals found for this company")
+            elif not deal_ids:
+                logger.info("No deals found (no project name extracted and no company)")
             
             # Build interaction content
             participants_list = "\n".join(all_participants)

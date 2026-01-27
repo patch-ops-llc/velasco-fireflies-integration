@@ -167,6 +167,9 @@ def trigger_sync():
     """
     Trigger full sync (async).
     Use for manual testing or scheduled triggers.
+    
+    Query params:
+        limit: Number of transcripts to fetch (default: 10, max: 500)
     """
     if sync_status["is_running"]:
         return jsonify({
@@ -174,16 +177,21 @@ def trigger_sync():
             "message": "A sync is already in progress"
         }), 409
     
+    # Get optional limit parameter
+    limit = request.args.get("limit", type=int) or config.TRANSCRIPT_LIMIT
+    limit = min(limit, 500)  # Cap at 500 for safety
+    
     # Start background processing
     thread = threading.Thread(
         target=run_sync_background,
+        args=(limit,),
         daemon=True
     )
     thread.start()
     
     return jsonify({
         "status": "accepted",
-        "message": "Sync started in background"
+        "message": f"Sync started in background (limit: {limit} transcripts)"
     }), 202
 
 
@@ -193,6 +201,9 @@ def trigger_sync_blocking():
     """
     Trigger full sync (blocking/synchronous).
     Use for testing - waits for completion.
+    
+    Query params:
+        limit: Number of transcripts to fetch (default: 10, max: 500)
     """
     if sync_status["is_running"]:
         return jsonify({
@@ -200,8 +211,48 @@ def trigger_sync_blocking():
             "message": "A sync is already in progress"
         }), 409
     
-    result = run_sync()
+    # Get optional limit parameter
+    limit = request.args.get("limit", type=int) or config.TRANSCRIPT_LIMIT
+    limit = min(limit, 500)  # Cap at 500 for safety
+    
+    result = run_sync(limit)
     return jsonify(result)
+
+
+@app.route("/api/sync/backfill", methods=["POST"])
+@require_api_key
+def trigger_backfill():
+    """
+    Backfill sync - fetches more historical transcripts.
+    Use to catch up on older calls that weren't synced.
+    
+    Query params:
+        limit: Number of transcripts to fetch (default: 100, max: 500)
+    """
+    if sync_status["is_running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "A sync is already in progress"
+        }), 409
+    
+    # Default to 100 for backfill
+    limit = request.args.get("limit", type=int) or 100
+    limit = min(limit, 500)  # Cap at 500 for safety
+    
+    logger.sync(f"Starting backfill sync with limit: {limit}")
+    
+    # Start background processing
+    thread = threading.Thread(
+        target=run_sync_background,
+        args=(limit,),
+        daemon=True
+    )
+    thread.start()
+    
+    return jsonify({
+        "status": "accepted",
+        "message": f"Backfill sync started (fetching last {limit} transcripts)"
+    }), 202
 
 
 @app.route("/api/sync/transcript/<transcript_id>", methods=["POST"])
@@ -282,6 +333,122 @@ def clear_cache():
     return jsonify({"status": "cache_cleared"})
 
 
+@app.route("/api/admin/debug-transcript/<transcript_id>", methods=["GET"])
+@require_api_key
+def debug_transcript(transcript_id: str):
+    """
+    Debug a specific transcript - shows what would happen during sync
+    without actually creating the interaction.
+    """
+    logger.debug(f"Debug request for transcript: {transcript_id}")
+    
+    # Fetch transcript
+    transcript = fireflies_client.fetch_transcript_by_id(transcript_id)
+    
+    if not transcript:
+        return jsonify({
+            "error": f"Transcript not found: {transcript_id}"
+        }), 404
+    
+    title = transcript.get("title", "Untitled")
+    
+    # Extract project name
+    project_name = sync_service.extract_project_name(title)
+    
+    # Search for deals by name
+    deals_by_name = []
+    if project_name:
+        deals_by_name = dealcloud_client.search_deals_by_name(project_name)
+    
+    # Get participants
+    all_participants = transcript.get("participants") or []
+    all_emails = [p for p in all_participants if p and "@" in p]
+    internal_domains = sync_service.internal_domains
+    external_emails = [e for e in all_emails if not sync_service.is_internal_email(e)]
+    
+    # Search for contacts
+    contacts = dealcloud_client.search_contacts_by_email(external_emails) if external_emails else []
+    
+    # Get summary info
+    summary = transcript.get("summary")
+    summary_info = {}
+    if summary:
+        summary_info = {
+            "has_overview": bool(summary.get("overview")),
+            "overview_length": len(summary.get("overview", "") or ""),
+            "has_shorthand_bullet": bool(summary.get("shorthand_bullet")),
+            "shorthand_bullet_length": len(summary.get("shorthand_bullet", "") or ""),
+            "has_outline": bool(summary.get("outline")),
+            "outline_length": len(summary.get("outline", "") or ""),
+            "has_action_items": bool(summary.get("action_items")),
+            "action_items_count": len(summary.get("action_items", []) or []),
+            "has_keywords": bool(summary.get("keywords")),
+            "keywords": summary.get("keywords", [])
+        }
+    
+    # Format content
+    formatted_content = sync_service.format_content(summary)
+    
+    return jsonify({
+        "transcript": {
+            "id": transcript_id,
+            "title": title,
+            "date": transcript.get("date"),
+            "duration": transcript.get("duration"),
+            "participants": all_participants
+        },
+        "analysis": {
+            "extracted_project_name": project_name,
+            "external_emails": external_emails,
+            "internal_domains_configured": internal_domains
+        },
+        "dealcloud_matches": {
+            "deals_by_project_name": [
+                {
+                    "id": d.get("EntryId"),
+                    "name": d.get("DealName"),
+                    "company": d.get("Company")
+                } for d in deals_by_name[:5]
+            ],
+            "contacts_found": [
+                {
+                    "id": c.get("EntryId"),
+                    "email": c.get("Email"),
+                    "name": c.get("FullName"),
+                    "company": c.get("Company")
+                } for c in contacts[:5]
+            ]
+        },
+        "summary_analysis": summary_info,
+        "formatted_content_length": len(formatted_content),
+        "formatted_content_preview": formatted_content[:500] if formatted_content else None
+    })
+
+
+@app.route("/api/admin/search-deal", methods=["GET"])
+@require_api_key
+def search_deal():
+    """Search deals by name (debug endpoint)"""
+    name = request.args.get("name")
+    
+    if not name:
+        return jsonify({"error": "name parameter required"}), 400
+    
+    deals = dealcloud_client.search_deals_by_name(name)
+    
+    return jsonify({
+        "search_term": name,
+        "found": len(deals),
+        "deals": [
+            {
+                "id": d.get("EntryId"),
+                "name": d.get("DealName"),
+                "company": d.get("Company")
+            } for d in deals[:10]
+        ]
+    })
+
+
 # ==================== Scheduler Endpoints ====================
 
 @app.route("/api/scheduler/status", methods=["GET"])
@@ -336,15 +503,17 @@ def scheduler_toggle():
 
 # ==================== Background Processing ====================
 
-def run_sync() -> dict:
+def run_sync(limit: int = None) -> dict:
     """Run sync and update status"""
     global sync_status
+    
+    limit = limit or config.TRANSCRIPT_LIMIT
     
     sync_status["is_running"] = True
     sync_status["last_run"] = datetime.now().isoformat()
     
     try:
-        result = sync_service.sync_all()
+        result = sync_service.sync_all(limit=limit)
         sync_status["last_status"] = "success"
         sync_status["last_result"] = result
         return result
@@ -359,10 +528,10 @@ def run_sync() -> dict:
         sync_status["is_running"] = False
 
 
-def run_sync_background():
+def run_sync_background(limit: int = None):
     """Run sync in background thread"""
     with app.app_context():
-        run_sync()
+        run_sync(limit)
 
 
 def scheduled_sync():

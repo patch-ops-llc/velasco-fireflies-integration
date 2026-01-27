@@ -351,6 +351,11 @@ class DealCloudClient:
         
         logger.interaction(f"Creating interaction: {subject}")
         
+        # Ensure notes is not empty - DealCloud may reject empty notes
+        if not notes or not notes.strip():
+            notes = f"Call recorded via Fireflies integration.\nSubject: {subject}"
+            logger.warning("Notes was empty, using fallback text")
+        
         # Build payload with flat structure (unflatten=yes)
         payload = [{
             "Subject": subject,
@@ -364,6 +369,15 @@ class DealCloudClient:
         
         if deal_ids:
             payload[0]["Deals"] = deal_ids
+        
+        # Log the payload for debugging (truncate notes for readability)
+        logger.debug(f"Interaction payload:")
+        logger.debug(f"  Subject: {subject}")
+        logger.debug(f"  Contacts: {contact_ids}")
+        logger.debug(f"  Companies: {payload[0].get('Companies', [])}")
+        logger.debug(f"  Deals: {payload[0].get('Deals', [])}")
+        logger.debug(f"  Notes length: {len(notes)} chars")
+        logger.debug(f"  Type: {config.INTERACTION_TYPE_ID}")
         
         try:
             response = self.session.post(
@@ -380,7 +394,8 @@ class DealCloudClient:
             logger.debug(f"Response status: {response.status_code}")
             
             if not response.ok:
-                logger.error(f"Interaction creation error: {response.status_code} - {response.text[:300]}")
+                logger.error(f"Interaction creation error: {response.status_code}")
+                logger.error(f"Response body: {response.text[:500]}")
                 return None
             
             data = response.json()
@@ -388,11 +403,21 @@ class DealCloudClient:
             
             entry_id = result.get("EntryId")
             
+            # Log full response for debugging
+            logger.debug(f"DealCloud response: {json.dumps(result, indent=2)[:500]}")
+            
             if entry_id == -1 or result.get("Errors"):
                 errors = result.get("Errors", [])
                 error_desc = ", ".join([f"{e.get('field')}: {e.get('description')}" for e in errors])
                 logger.error(f"Interaction creation failed: {error_desc}")
+                logger.error(f"Full error response: {json.dumps(result)[:500]}")
                 return None
+            
+            # Check if notes were actually saved
+            if result.get("Notes"):
+                logger.success(f"Notes saved ({len(result.get('Notes', ''))} chars in response)")
+            else:
+                logger.warning("Notes field empty in response - may not have been saved")
             
             logger.success(f"Interaction created (ID: {entry_id})")
             
@@ -401,7 +426,8 @@ class DealCloudClient:
                 "Subject": subject,
                 "ContactIds": contact_ids,
                 "CompanyId": company_id,
-                "DealIds": deal_ids
+                "DealIds": deal_ids,
+                "NotesLength": len(notes)
             }
             
         except requests.exceptions.RequestException as e:
@@ -486,36 +512,66 @@ class DealCloudClient:
         
         logger.deal(f"Searching deals by name: {deal_name}")
         
+        all_rows = []
+        
         try:
-            # Use $contains operator for partial matching
-            response = self.session.get(
-                url=f"{self.base_url}/api/rest/v4/data/entrydata/rows/deal",
-                params={
-                    "wrapIntoArrays": "true",
-                    "query": json.dumps({"DealName": {"$contains": deal_name}})
-                },
-                headers=self._get_headers(),
-                timeout=self.timeout
-            )
+            # Try multiple search strategies for better matching
+            search_strategies = [
+                # Strategy 1: Exact contains match
+                {"DealName": {"$contains": deal_name}},
+                # Strategy 2: Try without "Project " prefix if present
+                {"DealName": {"$contains": deal_name.replace("Project ", "").strip()}} if deal_name.lower().startswith("project ") else None,
+            ]
             
-            if self._handle_rate_limit(response):
-                return self.search_deals_by_name(deal_name)  # Retry
+            for query in search_strategies:
+                if query is None:
+                    continue
+                    
+                response = self.session.get(
+                    url=f"{self.base_url}/api/rest/v4/data/entrydata/rows/deal",
+                    params={
+                        "wrapIntoArrays": "true",
+                        "query": json.dumps(query)
+                    },
+                    headers=self._get_headers(),
+                    timeout=self.timeout
+                )
+                
+                if self._handle_rate_limit(response):
+                    return self.search_deals_by_name(deal_name)  # Retry
+                
+                if not response.ok:
+                    logger.warning(f"Deal name search error: {response.status_code} - {response.text[:200]}")
+                    continue
+                
+                data = response.json()
+                rows = data.get("rows", [])
+                
+                # Add unique rows
+                existing_ids = {r.get("EntryId") for r in all_rows}
+                for row in rows:
+                    if row.get("EntryId") not in existing_ids:
+                        all_rows.append(row)
+                        existing_ids.add(row.get("EntryId"))
+                
+                # If we found matches, log and potentially break
+                if rows:
+                    logger.success(f"Found {len(rows)} deal(s) with query: {query}")
             
-            if not response.ok:
-                logger.warning(f"Deal name search error: {response.status_code}")
-                self._cache[cache_key] = []
-                return []
-            
-            data = response.json()
-            rows = data.get("rows", [])
-            
-            if rows:
-                logger.success(f"Found {len(rows)} deal(s) matching '{deal_name}'")
+            if all_rows:
+                logger.success(f"Total: {len(all_rows)} unique deal(s) matching '{deal_name}'")
+                # Log deal details for debugging
+                for deal in all_rows[:3]:  # Log first 3
+                    deal_id = deal.get("EntryId")
+                    deal_display_name = deal.get("DealName", "Unknown")
+                    company_ref = deal.get("Company", [])
+                    company_info = f"Company: {company_ref}" if company_ref else "No company"
+                    logger.deal(f"  Found: {deal_display_name} (ID: {deal_id}) - {company_info}")
             else:
-                logger.info(f"No deals found matching '{deal_name}'")
+                logger.warning(f"No deals found matching '{deal_name}' with any search strategy")
             
-            self._cache[cache_key] = rows
-            return rows
+            self._cache[cache_key] = all_rows
+            return all_rows
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Deal name search failed: {str(e)}", e)

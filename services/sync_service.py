@@ -268,19 +268,17 @@ class SyncService:
                 else:
                     logger.warning(f"Cannot create {len(missing_emails)} contact(s) - Company required but not found")
             
-            # If no company and no contacts, skip
+            # Note: We proceed even without a company from contacts
+            # because we may find a deal by project name and get the company from there
             if not company_id and not contact_ids:
-                logger.warning("SKIPPED: No company found and no existing contacts")
-                return SyncResult(
-                    transcript_id=transcript_id,
-                    transcript_title=title,
-                    status="skipped",
-                    reason="No company found and no existing contacts"
-                )
+                logger.warning("No company from contacts and no existing contacts found")
+                logger.info("Will attempt to find deal by project name...")
             
             # Search for deals - PRIORITY: Search by project name from title first
             deal_ids = []
             found_deals = []
+            target_company_id = None  # Company from the deal (target company, not banker)
+            target_company_name = None
             
             # Step 1: Extract project name from call title and search by name
             project_name = self.extract_project_name(title)
@@ -302,6 +300,21 @@ class SyncService:
                                 "id": deal_id
                             })
                             logger.deal(f"  {deal_name} [ID: {deal_id}] (matched by project name)")
+                            
+                            # IMPORTANT: Extract target company from the deal
+                            # This is the actual company (e.g., NEC Inc.), not the banker
+                            if not target_company_id:
+                                deal_company_ref = deal.get("Company", [])
+                                if isinstance(deal_company_ref, list) and deal_company_ref:
+                                    target_company_id = deal_company_ref[0].get("id")
+                                    target_company_name = deal_company_ref[0].get("name", "Unknown")
+                                    logger.company(f"  Deal's target company: {target_company_name} (ID: {target_company_id})")
+                                elif isinstance(deal_company_ref, dict) and deal_company_ref:
+                                    target_company_id = deal_company_ref.get("id")
+                                    target_company_name = deal_company_ref.get("name", "Unknown")
+                                    logger.company(f"  Deal's target company: {target_company_name} (ID: {target_company_id})")
+            else:
+                logger.warning(f"Could not extract project name from title: '{title}'")
             
             # Step 2: If no deals found by name and we have a company, search by company as fallback
             if not deal_ids and company_id:
@@ -326,10 +339,43 @@ class SyncService:
             elif not deal_ids:
                 logger.info("No deals found (no project name extracted and no company)")
             
+            # Use target company from deal if found, otherwise use banker's company
+            # This ensures Project Rubicon links to NEC Inc., not Crutchfield Capital
+            final_company_id = target_company_id if target_company_id else company_id
+            if target_company_id and company_id and target_company_id != company_id:
+                logger.company(f"Using deal's target company ({target_company_name}) instead of contact's company")
+            
+            # Now check if we have enough to create an interaction
+            if not final_company_id and not contact_ids and not deal_ids:
+                logger.warning("SKIPPED: No company, no contacts, and no deals found")
+                return SyncResult(
+                    transcript_id=transcript_id,
+                    transcript_title=title,
+                    status="skipped",
+                    reason="No company, contacts, or deals found to link interaction"
+                )
+            
             # Build interaction content
             participants_list = "\n".join(all_participants)
             summary = transcript.get("summary")
+            
+            # Debug logging for summary content
+            if summary:
+                logger.info(f"Summary data received from Fireflies:")
+                logger.info(f"  - overview: {'Yes' if summary.get('overview') else 'No'} ({len(summary.get('overview', '') or '')} chars)")
+                logger.info(f"  - shorthand_bullet: {'Yes' if summary.get('shorthand_bullet') else 'No'} ({len(summary.get('shorthand_bullet', '') or '')} chars)")
+                logger.info(f"  - outline: {'Yes' if summary.get('outline') else 'No'} ({len(summary.get('outline', '') or '')} chars)")
+                logger.info(f"  - action_items: {'Yes' if summary.get('action_items') else 'No'} ({len(summary.get('action_items', []) or [])} items)")
+                logger.info(f"  - keywords: {'Yes' if summary.get('keywords') else 'No'}")
+            else:
+                logger.warning("No summary data received from Fireflies - notes will be minimal!")
+            
             content = self.format_content(summary)
+            
+            if content:
+                logger.info(f"Formatted content length: {len(content)} characters")
+            else:
+                logger.warning("Formatted content is empty - interaction will have minimal notes")
             
             interaction_subject = f"Call: {title}"
             interaction_notes = (
@@ -341,6 +387,8 @@ class SyncService:
             
             if content:
                 interaction_notes += f"\n\n{content}"
+            
+            logger.info(f"Total interaction notes length: {len(interaction_notes)} characters")
             
             # Check for existing interaction
             logger.search("Checking for existing interaction...")
@@ -356,7 +404,7 @@ class SyncService:
                     status="skipped",
                     reason="Interaction already exists",
                     interaction_id=entry_id,
-                    company_id=company_id,
+                    company_id=final_company_id,
                     contact_ids=contact_ids,
                     deal_ids=deal_ids,
                     created_contacts=created_contacts
@@ -364,24 +412,31 @@ class SyncService:
             
             # Create new interaction
             logger.interaction("Creating new interaction in DealCloud...")
+            logger.interaction(f"  Subject: {interaction_subject}")
+            logger.interaction(f"  Company ID: {final_company_id}")
+            logger.interaction(f"  Contact IDs: {contact_ids}")
+            logger.interaction(f"  Deal IDs: {deal_ids}")
+            logger.interaction(f"  Notes length: {len(interaction_notes)} chars")
             
             result = dealcloud_client.create_interaction(
                 subject=interaction_subject,
                 notes=interaction_notes,
                 contact_ids=contact_ids,
-                company_id=company_id,
+                company_id=final_company_id,
                 deal_ids=deal_ids
             )
             
             if result:
                 logger.success(f"Interaction created (ID: {result.get('EntryId')})")
+                logger.success(f"  Linked to company: {final_company_id}")
+                logger.success(f"  Linked to deals: {deal_ids}")
                 
                 return SyncResult(
                     transcript_id=transcript_id,
                     transcript_title=title,
                     status="created",
                     interaction_id=result.get("EntryId"),
-                    company_id=company_id,
+                    company_id=final_company_id,
                     contact_ids=contact_ids,
                     deal_ids=deal_ids,
                     found_contacts=found_contacts,
@@ -394,7 +449,7 @@ class SyncService:
                     transcript_title=title,
                     status="error",
                     error="Failed to create interaction",
-                    company_id=company_id,
+                    company_id=final_company_id,
                     created_contacts=created_contacts
                 )
             
@@ -407,12 +462,13 @@ class SyncService:
                 error=str(e)
             )
     
-    def sync_all(self, processed_ids: Optional[Set[str]] = None) -> Dict[str, Any]:
+    def sync_all(self, processed_ids: Optional[Set[str]] = None, limit: Optional[int] = None) -> Dict[str, Any]:
         """
         Run full sync: fetch all new transcripts and process them.
         
         Args:
             processed_ids: Set of already processed transcript IDs
+            limit: Number of transcripts to fetch (default: from config)
             
         Returns:
             Summary of sync operation
@@ -421,6 +477,8 @@ class SyncService:
         
         logger.separator("=", 60)
         logger.sync("STARTING FIREFLIES TO DEALCLOUD SYNC")
+        if limit:
+            logger.sync(f"Fetching last {limit} transcripts")
         logger.separator("=", 60)
         
         start_time = datetime.now()
@@ -429,8 +487,8 @@ class SyncService:
         dealcloud_client.clear_cache()
         
         # Fetch transcripts
-        logger.outgoing("Fetching transcripts from Fireflies...")
-        transcripts = fireflies_client.fetch_transcripts()
+        logger.outgoing(f"Fetching transcripts from Fireflies (limit: {limit or 'default'})...")
+        transcripts = fireflies_client.fetch_transcripts(limit=limit)
         
         if not transcripts:
             logger.warning("No transcripts retrieved from Fireflies")
@@ -473,6 +531,8 @@ class SyncService:
         
         return {
             "success": True,
+            "transcripts_fetched": len(transcripts),
+            "transcripts_limit": limit or "default",
             "processed_count": len(results),
             "created_count": created_count,
             "skipped_count": skipped_count,

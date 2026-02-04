@@ -599,8 +599,15 @@ def startup():
     logger.separator("=", 60)
 
 
-# Cleanup on shutdown
-atexit.register(lambda: scheduler.shutdown(wait=False))
+# Cleanup on shutdown (only if scheduler is running)
+def safe_shutdown():
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+
+atexit.register(safe_shutdown)
 
 
 # ==================== Main Entry Point ====================

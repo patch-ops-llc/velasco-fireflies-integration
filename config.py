@@ -33,7 +33,7 @@ class Config:
         self.TRANSCRIPT_LIMIT = int(os.getenv("TRANSCRIPT_LIMIT", "10"))
         self.RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "0.3"))
         self.BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
-        self.CRON_INTERVAL_MINUTES = int(os.getenv("CRON_INTERVAL_MINUTES", "360"))  # 6 hours
+        self.CRON_INTERVAL_MINUTES = int(os.getenv("CRON_INTERVAL_MINUTES", "120"))  # Default: 2 hours (120 min)
         
         # API settings
         self.API_TIMEOUT = int(os.getenv("API_TIMEOUT", "30"))

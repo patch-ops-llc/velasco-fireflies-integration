@@ -1,0 +1,1006 @@
+# HubSpot-QuantumReverse Integration Guide
+
+**Complete Technical Documentation & Lessons Learned**
+
+**Version:** 2.0.0  
+**Last Updated:** January 5, 2026  
+**Project:** Improve Retirement HubSpot-QR Integration
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Architecture Overview](#2-architecture-overview)
+3. [System Components](#3-system-components)
+4. [API Reference](#4-api-reference)
+5. [Field Mapping Reference](#5-field-mapping-reference)
+6. [Data Flow Patterns](#6-data-flow-patterns)
+7. [Deployment Guide](#7-deployment-guide)
+8. [Configuration Reference](#8-configuration-reference)
+9. [Lessons Learned](#9-lessons-learned)
+10. [Troubleshooting Guide](#10-troubleshooting-guide)
+11. [Best Practices](#11-best-practices)
+12. [Maintenance & Operations](#12-maintenance--operations)
+
+---
+
+## 1. Executive Summary
+
+### Project Overview
+
+This integration synchronizes data bidirectionally between **HubSpot CRM** (deals, leads, contacts) and **QuantumReverse** (HECM loan origination system). The system is deployed on Railway and processes both real-time webhook events and scheduled batch synchronizations.
+
+### Key Achievements
+
+| Metric | Value |
+|--------|-------|
+| **Fields Synced per Deal** | 123+ |
+| **HubSpot Properties Created** | 230 |
+| **Sync Types Supported** | Deals, Leads, Contacts |
+| **Data Direction** | Bidirectional |
+| **Deployment Platform** | Railway (auto-deploy from GitHub) |
+| **Cron Schedule** | Every 6 hours (configurable) |
+
+### Integration Capabilities
+
+| Feature | Direction | Notes |
+|---------|-----------|-------|
+| Sync Deal ↔ QR Loan | Bidirectional | Full loan data sync |
+| Create Loan from Lead | HubSpot → QR | Creates new loans in QR |
+| Update Loan Data | HubSpot → QR | Limited fields (API restrictions) |
+| Read Loan Data | QR → HubSpot | Full data extraction |
+| Contact Sync | HubSpot internal | Contact data to associated leads |
+| Borrower Info Sync | Deal → Lead/Contact | Cascades borrower info |
+| Batch Sync | Scheduled | Syncs all active deals periodically |
+
+---
+
+## 2. Architecture Overview
+
+### High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              HubSpot CRM                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                                   │
+│  │  Deals   │  │  Leads   │  │ Contacts │                                   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                                   │
+└───────┼─────────────┼─────────────┼─────────────────────────────────────────┘
+        │             │             │
+        │ Workflow Webhooks         │
+        ▼             ▼             ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Railway Integration Service                           │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                          Flask Application                            │  │
+│  │                                                                        │  │
+│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────────────┐ │  │
+│  │  │ Webhook Handler│  │  API Endpoints │  │   Admin Endpoints      │ │  │
+│  │  │ (Background)   │  │  (Manual Sync) │  │   (Debug/Verify)       │ │  │
+│  │  └───────┬────────┘  └───────┬────────┘  └───────────┬────────────┘ │  │
+│  │          │                   │                        │              │  │
+│  │          ▼                   ▼                        ▼              │  │
+│  │  ┌───────────────────────────────────────────────────────────────┐  │  │
+│  │  │                    Sync Services Layer                         │  │  │
+│  │  │  DealSyncService | LeadSyncService | ContactSyncService       │  │  │
+│  │  └───────────────────────────────────────────────────────────────┘  │  │
+│  │                              │                                       │  │
+│  │          ┌───────────────────┼───────────────────┐                  │  │
+│  │          ▼                   ▼                   ▼                  │  │
+│  │  ┌───────────────┐   ┌───────────────┐   ┌───────────────────┐    │  │
+│  │  │ HubSpotClient │   │ QRClient      │   │ BatchSyncService  │    │  │
+│  │  └───────────────┘   └───────────────┘   └───────────────────┘    │  │
+│  │                                                     │              │  │
+│  │                                          ┌──────────┘              │  │
+│  │                                          ▼                         │  │
+│  │                                 ┌─────────────────┐                │  │
+│  │                                 │  APScheduler    │                │  │
+│  │                                 │  (Cron Jobs)    │                │  │
+│  │                                 └─────────────────┘                │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└────────────────────────────────────┬─────────────────────────────────────────┘
+                                     │
+                                     │ REST API Calls
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        QuantumReverse LOS                                    │
+│  ┌──────────────────┐  ┌──────────────────┐                                 │
+│  │   Export API     │  │   Import API     │                                 │
+│  │  (Read Loans)    │  │ (Create/Update)  │                                 │
+│  └──────────────────┘  └──────────────────┘                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Request Flow: Webhook Sync
+
+```
+1. HubSpot Workflow Triggers ─────────────────────────────────────────────────►
+   │
+2. │ POST /webhook/hubspot { objectId, objectType }
+   │
+3. ▼ Validate Request
+   │
+4. │ Return HTTP 202 Accepted immediately (within 30 seconds HubSpot limit)
+   │
+5. ▼ Start Background Thread
+   │
+6. │ Fetch Deal from HubSpot API
+   │
+7. │ Look up GUID in QR (if loan_id but no GUID)
+   │
+8. ▼ Fetch Full Loan Data from QR Export API
+   │
+9. │ Extract 123+ fields via extraction methods
+   │
+10.│ Update HubSpot Deal with extracted data
+   │
+11.▼ Update sync status: "synced" + timestamp
+```
+
+### Technology Stack
+
+| Component | Technology | Version |
+|-----------|------------|---------|
+| Language | Python | 3.11.6 |
+| Web Framework | Flask | 3.0.0 |
+| WSGI Server | Gunicorn | 21.2.0 |
+| HTTP Client | Requests | 2.31.0 |
+| Scheduler | APScheduler | 3.10.4 |
+| Hosting | Railway | Latest |
+| Source Control | GitHub | - |
+
+---
+
+## 3. System Components
+
+### 3.1 Flask Application (`app.py`)
+
+The main application entry point with:
+- Health check endpoints
+- Webhook handlers
+- Manual sync endpoints
+- Admin/debug endpoints
+- Cron job scheduling
+
+### 3.2 Service Layer
+
+| Service | File | Purpose |
+|---------|------|---------|
+| `DealSyncService` | `sync_deals.py` | Sync HubSpot Deals ↔ QR Loans |
+| `LeadSyncService` | `sync_leads.py` | Create/Update QR Loans from Leads |
+| `ContactSyncService` | `sync_contacts.py` | Sync Contact data to Leads |
+| `BatchSyncService` | `batch_sync.py` | Scheduled batch sync with queue |
+| `HubSpotClient` | `hubspot.py` | HubSpot API wrapper |
+| `QuantumReverseClient` | `quantum_reverse.py` | QR API wrapper |
+
+### 3.3 Configuration (`config.py`)
+
+Environment-based configuration with validation:
+- Required variables raise errors on startup if missing
+- Sensible defaults for optional settings
+- Type conversion (int, float, bool)
+
+### 3.4 Utilities
+
+| Utility | File | Purpose |
+|---------|------|---------|
+| Logger | `utils/logger.py` | Consistent logging with emoji indicators |
+| Date Utils | `utils/date_utils.py` | QR date format conversion |
+
+---
+
+## 4. API Reference
+
+### 4.1 Health & Status Endpoints
+
+| Endpoint | Method | Description | Response |
+|----------|--------|-------------|----------|
+| `/health` | GET | Railway health check | `{ status, environment, uptime_seconds }` |
+| `/api/status` | GET | Full system status | `{ status, config, batch_sync status }` |
+
+### 4.2 Webhook Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/webhook/hubspot` | POST | Main webhook (async processing) |
+| `/webhook/hubspot/test` | GET | Test webhook reachability |
+
+**Webhook Payload:**
+```json
+{
+  "objectId": "123456789",
+  "objectType": "deal"
+}
+```
+
+**Response:** `HTTP 202 Accepted`
+```json
+{
+  "status": "accepted",
+  "message": "Deal sync started",
+  "deal_id": "123456789"
+}
+```
+
+### 4.3 Sync Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/sync/deal/<deal_id>` | POST | Sync single deal |
+| `/api/sync/lead/<lead_id>` | POST | Sync/upsert lead to QR |
+| `/api/sync/contact-to-lead/<contact_id>` | POST | Sync contact to lead |
+| `/api/sync/borrower-info/<deal_id>` | POST | Cascade borrower info |
+| `/api/lookup-guid/<deal_id>` | POST | Look up GUID by loan_id |
+
+### 4.4 Batch Sync Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/batch/status` | GET | Get batch sync status |
+| `/api/batch/trigger` | POST | Manually trigger batch sync |
+| `/api/batch/test` | POST | Test trigger (synchronous) |
+| `/api/batch/cron/enable` | POST | Enable scheduled cron |
+| `/api/batch/cron/disable` | POST | Disable scheduled cron |
+| `/api/batch/cron/toggle` | POST | Toggle cron on/off |
+| `/api/batch/queue/add` | POST | Add item to sync queue |
+
+### 4.5 Admin Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/admin/verify-hubspot-properties` | GET | Check missing properties |
+| `/api/admin/verify-hubspot-properties` | POST | Create missing properties |
+| `/api/admin/test-deal-fetch/<deal_id>` | GET | Debug deal fetch |
+| `/api/admin/test-qr-extract/<deal_id>` | GET | Preview extracted fields |
+| `/api/admin/deals-to-sync` | GET | List deals for batch sync |
+| `/api/admin/raw-qr-data/<deal_id>` | GET | View raw QR API response |
+| `/api/admin/search-deals` | GET | Search deals by name |
+| `/api/admin/create-properties` | POST | Create specific properties |
+
+---
+
+## 5. Field Mapping Reference
+
+### 5.1 Field Categories Overview
+
+| Category | Field Count | Direction |
+|----------|-------------|-----------|
+| Core Borrower | 12 | Bidirectional |
+| Co-Borrower | 8 | HubSpot → QR (create only) |
+| Alternative Contact | 9 | QR → HubSpot |
+| Property | 16 | Bidirectional |
+| Loan IDs/Status | 7 | Mixed |
+| Loan Officer | 4 | Mixed |
+| Calculation | 14 | QR → HubSpot |
+| Financial Assessment | 11 | QR → HubSpot |
+| Processing/Underwriting | 4 | QR → HubSpot |
+| Credit | 2 | QR → HubSpot |
+| Title | 5 | QR → HubSpot |
+| Appraisal | 7 | QR → HubSpot |
+| Second Appraisal | 8 | QR → HubSpot |
+| Key Dates | 8 | QR → HubSpot |
+| Changed Circumstance | 2 | QR → HubSpot |
+| Sale/Purchase | 3 | QR → HubSpot |
+| Milestones | ~95 | QR → HubSpot |
+| Borrower Declarations | 30 | QR → HubSpot |
+| Race & Ethnicity | ~64 | QR → HubSpot |
+| **Total** | **~230** | - |
+
+### 5.2 Data Direction Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| Bidirectional | Data flows both ways |
+| QR → HubSpot | Read-only from QR |
+| HubSpot → QR | Push to QR only |
+| HubSpot → QR (create only) | Push only on loan creation |
+
+### 5.3 Core Field Mappings
+
+#### Borrower Fields
+
+| HubSpot Property | QR API Path | Direction |
+|------------------|-------------|-----------|
+| `borrower_first_name` | `Borrowers.Items[0].FirstName` | Bidirectional |
+| `borrower_last_name` | `Borrowers.Items[0].LastName` | Bidirectional |
+| `borrower_email` | `Borrowers.Items[0].Communication.Email` | Bidirectional |
+| `borrower_phone` | `Borrowers.Items[0].Communication.Phone` | Bidirectional |
+| `borrower_dob` | `Borrowers.Items[0].Dob` | Bidirectional |
+| `gender` | `Borrowers.Items[0].Sex.Name` | Bidirectional |
+| `marital_status` | `Borrowers.Items[0].MaritalStatus.Name` | Bidirectional |
+| `borrower_fico_score` | `Borrowers.Items[0].FicoScore` | QR → HubSpot |
+| `stated_monthly_income` | `Borrowers.Items[0].MonthlyIncome` | QR → HubSpot |
+
+#### Property Fields
+
+| HubSpot Property | QR API Path | Direction |
+|------------------|-------------|-----------|
+| `property_address` | `Property.Address.Address1` | Bidirectional |
+| `property_city` | `Property.Address.City` | Bidirectional |
+| `property_state` | `Property.Address.StateFk` | Bidirectional |
+| `property_zip_code` | `Property.Address.Zip` | Bidirectional |
+| `property_value_estimate` | `Property.PropertyValueEstimate` | Bidirectional |
+| `qr_property_value` | `Property.Value` | QR → HubSpot |
+| `property_type` | `Property.PropertyType.Name` | QR → HubSpot |
+| `year_built` | `Property.YearBuilt` | QR → HubSpot |
+
+#### Calculation Fields
+
+| HubSpot Property | QR API Path | Notes |
+|------------------|-------------|-------|
+| `qr_product` | `Product.Name` | e.g., "CMT Monthly Cap 5" |
+| `qr_product_type` | `ProductType.Name` | e.g., "HECM Arm" |
+| `qr_margin` | `Calculation.MarginOrRate` | Rounded to 4 decimals |
+| `expected_rate` | `Calculation.ExpectedRate` | Rounded to 4 decimals |
+| `qr_principal_limit` | `Calculation.PrincipalLimit` | Rounded to 2 decimals |
+| `qr_max_claim_amount` | `Calculation.MaxClaimAmount` | Rounded to 2 decimals |
+| `qr_available_funds` | `Calculation.AvailableFunds` | Rounded to 2 decimals |
+| `qr_utilization_percent` | Calculated: `(UPB / PL) * 100` | Derived field |
+
+### 5.4 Milestone Fields
+
+Each milestone extracts 5 fields:
+
+| Field Pattern | QR Source |
+|---------------|-----------|
+| `{prefix}_start_date` | `Milestone.StartDate` |
+| `{prefix}_expected_date` | `Milestone.ExpectedCompletionDate` |
+| `{prefix}_completed_date` | `Milestone.ActualCompletionDate` |
+| `{prefix}_assignee` | `Milestone.Assignee.FirstName + LastName` |
+| `{prefix}_status` | Derived: "Completed"/"In Progress"/"Scheduled"/"Not Started" |
+
+**Milestone Prefixes:**
+- `file_started_`, `application_signed_`, `application_taken_`
+- `processing_`, `conditional_approval_`, `clear_to_close_`
+- `closing_docs_drawn_`, `funding_`, `closing_`
+- `pa_submission_`, `pa_channel_intake_`, `pa_channel_processing_`
+- And more...
+
+### 5.5 Borrower Declarations (32 Fields)
+
+| HubSpot Pattern | QR Source |
+|-----------------|-----------|
+| `{borrower/co_borrower}_primary_residence` | `Declarations.PrimaryResidence` |
+| `{borrower/co_borrower}_citizenship` | `Declarations.Citizenship.Name` |
+| `{borrower/co_borrower}_declared_bankruptcy` | `Declarations.HasDeclaredBankruptcy` |
+| `{borrower/co_borrower}_foreclosed_property` | `Declarations.HasForeclosedProperty` |
+| `{borrower/co_borrower}_party_to_lawsuit` | `Declarations.IsPartyToLawsuit` |
+| ... | (16 fields per borrower) |
+
+### 5.6 Race & Ethnicity (64+ Fields)
+
+| HubSpot Pattern | QR Source |
+|-----------------|-----------|
+| `{borrower/co_borrower}_hispanic_latino` | `Ethnicity.HispanicOrLatino` |
+| `{borrower/co_borrower}_white` | `Race.White` |
+| `{borrower/co_borrower}_asian` | `Race.Asian` |
+| `{borrower/co_borrower}_black_african_american` | `Race.BlackOrAfricanAmerican` |
+| ... | (30+ fields per borrower) |
+
+---
+
+## 6. Data Flow Patterns
+
+### 6.1 Deal Sync Flow (Typical)
+
+```
+1. HubSpot Workflow triggers on deal property change
+2. Webhook sends POST to /webhook/hubspot with deal_id
+3. Integration fetches deal from HubSpot
+4. If no GUID but has loan_id: looks up GUID via QR FindLoan API
+5. Fetches full loan data via QR Export/Loan/{guid}
+6. Extracts 123+ fields using extraction methods
+7. Updates HubSpot deal with extracted data
+8. Sets quantum_reverse_sync_status = "synced"
+9. Sets quantum_reverse_last_sync = current timestamp
+```
+
+### 6.2 Lead Upsert Flow
+
+```
+1. Lead is created/updated in HubSpot with borrower info
+2. Workflow triggers POST to /api/sync/lead/{lead_id}
+3. Integration builds loan creation payload from lead properties
+4. If lead has no existing GUID:
+   - Creates new loan via QR Import/Loan/Create
+   - Stores returned GUID on lead
+5. If lead has GUID:
+   - Updates existing loan via QR Import/Loan/{guid}/Update
+6. Fetches updated loan data and syncs back to lead
+```
+
+### 6.3 Batch Sync Flow
+
+```
+1. APScheduler triggers batch sync every 6 hours (configurable)
+2. BatchSyncService fetches all deals with loan_id or GUID
+3. For each deal (rate-limited):
+   - Calls DealSyncService.sync_deal()
+   - Tracks success/failure statistics
+   - Logs progress
+4. Same process for leads
+5. Logs final statistics
+```
+
+### 6.4 Contact to Lead Flow
+
+```
+1. Contact is updated with new data
+2. Workflow triggers POST to /api/sync/contact-to-lead/{contact_id}
+3. Integration fetches contact associations
+4. Finds associated leads
+5. Copies relevant contact properties to each lead
+```
+
+---
+
+## 7. Deployment Guide
+
+### 7.1 Prerequisites
+
+- GitHub repository with code
+- Railway account
+- QR API key
+- HubSpot Private App token
+
+### 7.2 Required Files
+
+| File | Purpose |
+|------|---------|
+| `requirements.txt` | Python dependencies with versions |
+| `Procfile` | Gunicorn command for Railway |
+| `railway.toml` | Railway-specific configuration |
+| `runtime.txt` | Python version specification |
+| `env.example` | Template for environment variables |
+
+### 7.3 Railway Deployment Steps
+
+1. **Connect GitHub Repository**
+   ```
+   Railway Dashboard → New Project → Deploy from GitHub
+   ```
+
+2. **Configure Environment Variables**
+   
+   ⚠️ **CRITICAL:** Add variables to the **SERVICE**, not just the project!
+   
+   ```
+   Railway Dashboard → Service → Variables → Add Variable
+   ```
+   
+   Required variables:
+   ```
+   QR_API_KEY=your-api-key
+   HUBSPOT_TOKEN=your-hubspot-token
+   ENVIRONMENT=production
+   ```
+
+3. **Generate Public Domain**
+   ```
+   Railway Dashboard → Service → Settings → Networking → Generate Domain
+   ```
+
+4. **Verify Health Check**
+   ```bash
+   curl https://your-app.up.railway.app/health
+   ```
+
+### 7.4 HubSpot Workflow Configuration
+
+Create workflows that POST to your Railway webhook:
+
+```json
+POST https://your-app.up.railway.app/webhook/hubspot
+Content-Type: application/json
+
+{
+  "objectId": "{{deal.id}}",
+  "objectType": "deal"
+}
+```
+
+### 7.5 Deployment Checklist
+
+#### Pre-Deployment
+- [ ] All secrets in environment variables (no hardcoded credentials)
+- [ ] `requirements.txt` has pinned versions
+- [ ] `Procfile` or `railway.toml` configured
+- [ ] `.gitignore` excludes `.env` and `__pycache__`
+- [ ] `/health` endpoint exists and returns 200
+
+#### Railway Setup
+- [ ] GitHub repo connected
+- [ ] All environment variables added to SERVICE
+- [ ] Public domain generated
+- [ ] Health check passing
+
+#### HubSpot Setup
+- [ ] Webhook URL configured in workflows
+- [ ] All required properties created (use `/api/admin/verify-hubspot-properties`)
+- [ ] Test workflow with sample record
+
+#### Post-Deployment
+- [ ] Test `/health` endpoint
+- [ ] Test manual sync with `/api/sync/deal/{id}`
+- [ ] Monitor Railway logs for first few syncs
+- [ ] Disable old integration if migrating
+
+---
+
+## 8. Configuration Reference
+
+### 8.1 Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `QR_API_KEY` | ✅ | - | QuantumReverse API key |
+| `HUBSPOT_TOKEN` | ✅ | - | HubSpot Private App token |
+| `QR_EXPORT_BASE_URL` | ❌ | `https://app.quantumreverse.com/PublicApi/Export` | QR Export API base |
+| `QR_IMPORT_BASE_URL` | ❌ | `https://app.quantumreverse.com/PublicApi/Import` | QR Import API base |
+| `ENVIRONMENT` | ❌ | `production` | Environment name |
+| `DEBUG` | ❌ | `false` | Enable debug logging |
+| `BATCH_SIZE` | ❌ | `25` | Records per batch sync |
+| `RATE_LIMIT_DELAY` | ❌ | `1.0` | Seconds between API calls |
+| `CRON_INTERVAL_MINUTES` | ❌ | `360` | Batch sync interval (6 hours) |
+| `MAX_RETRIES` | ❌ | `3` | API retry attempts |
+| `RETRY_DELAY` | ❌ | `2.0` | Base retry delay (exponential) |
+| `API_TIMEOUT` | ❌ | `30` | API request timeout |
+
+### 8.2 Gunicorn Settings
+
+Configured in `Procfile`:
+```
+web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+```
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `--workers 2` | 2 workers | Balance for Railway resources |
+| `--threads 4` | 4 threads per worker | Handle concurrent requests |
+| `--timeout 120` | 120 seconds | Allow long sync operations |
+
+---
+
+## 9. Lessons Learned
+
+### 9.1 Platform & Architecture
+
+#### Railway vs Zapier/HubSpot Custom Code
+
+| Aspect | Zapier/Custom Code | Railway |
+|--------|-------------------|---------|
+| **Hosting** | Managed platform | Self-hosted |
+| **Secrets** | Platform UI | Environment variables |
+| **Timeouts** | Platform limits (30s) | You control (120s+) |
+| **Debugging** | Limited logs | Full log access |
+| **Cost** | Per-task pricing | Fixed monthly (~$5-20) |
+| **Complexity** | Low | Higher (but more control) |
+
+**Key Insight:** For complex integrations with many fields and business logic, self-hosting provides the flexibility needed. Platform solutions hit limits quickly.
+
+#### Environment Variable Gotcha
+
+⚠️ **Railway has TWO places for variables:**
+- **Project Variables** - Shared across services
+- **Service Variables** - Apply to specific service
+
+**Always add variables to the SERVICE, not just the project!** Variables added only at the project level won't be available to your app unless explicitly linked.
+
+### 9.2 HubSpot API Lessons
+
+#### Webhook Timeout: 30 Seconds
+
+HubSpot webhooks timeout after 30 seconds. If your sync takes longer:
+- HubSpot shows a timeout error in workflow history
+- HubSpot may retry (causing duplicate processing)
+
+**Solution:** Process webhooks asynchronously:
+```python
+@app.route('/webhook/hubspot', methods=['POST'])
+def hubspot_webhook():
+    data = request.json
+    deal_id = data.get('objectId')
+    
+    # Start background thread immediately
+    thread = threading.Thread(target=process_deal, args=(deal_id,))
+    thread.daemon = True
+    thread.start()
+    
+    # Return HTTP 202 within milliseconds
+    return jsonify({"status": "accepted"}), 202
+```
+
+#### Property Creation
+
+HubSpot requires properties to exist before you can write to them. The integration includes an admin endpoint to:
+1. Check which properties are missing
+2. Automatically create missing properties
+
+```bash
+# Check missing properties
+GET /api/admin/verify-hubspot-properties
+
+# Create missing properties
+POST /api/admin/verify-hubspot-properties
+```
+
+#### Field Naming Conventions
+
+HubSpot custom field internal names often differ from display names:
+- Physical address might be `facility_street` not `address`
+- Always check HubSpot property settings or API responses for actual field names
+
+### 9.3 QuantumReverse API Lessons
+
+#### Borrower Update Limitation
+
+**Critical API Limitation:** The QR API does NOT support updating existing borrowers.
+
+| Operation | Supported | Notes |
+|-----------|-----------|-------|
+| Create loan with borrower(s) | ✅ | Full data at creation |
+| Read borrower data | ✅ | Always works |
+| Update existing borrower | ❌ | Not supported |
+| Add co-borrower to existing loan | ❌ | Not supported |
+
+**Workaround:** Make borrower changes directly in QuantumReverse. Changes will sync to HubSpot on the next sync cycle.
+
+#### Nested JSON Structure
+
+QR returns deeply nested JSON. Example path to get co-borrower FICO score:
+```python
+loan_data.get('Borrowers', {}).get('Items', [])[1].get('FicoScore')
+```
+
+Always use `.get()` with defaults to handle missing data gracefully.
+
+#### Value Field Logic
+
+The `Property.Value` field in QR has implied business logic:
+- Returns Appraised Value if available
+- Falls back to 2nd Appraised Value
+- Falls back to Estimated Value
+
+Created separate HubSpot fields for clarity:
+- `property_value_estimate` = Original estimate
+- `qr_property_value` = Current QR value (with implied logic)
+
+### 9.4 Data Type & Format Lessons
+
+#### Boolean Handling
+
+QR returns booleans, but HubSpot may need strings:
+```python
+result['has_septic'] = 'true' if data.get('HasSeptic') else 'false'
+```
+
+#### Date Formatting
+
+QR returns dates in various formats. Normalize to `YYYY-MM-DD`:
+```python
+def format_qr_date_to_string(date_value):
+    if not date_value:
+        return None
+    # Handle ISO format, .NET dates, etc.
+    # Return as YYYY-MM-DD string
+```
+
+#### Decimal Precision
+
+Round financial values consistently:
+```python
+if calc.get('PrincipalLimit') is not None:
+    result['qr_principal_limit'] = round(calc['PrincipalLimit'], 2)
+```
+
+### 9.5 Case Sensitivity
+
+```python
+# BAD - Will miss variations in case
+if value == "Borrower":
+    pass
+
+# GOOD - Normalize first
+if value.lower().strip() == "borrower":
+    pass
+```
+
+### 9.6 Rate Limiting
+
+Both HubSpot and QR have API rate limits:
+- HubSpot: 100 requests/10 seconds (private apps)
+- QR: Varies by endpoint
+
+**Solution:** Add delays between batch operations:
+```python
+RATE_LIMIT_DELAY = 1.0  # seconds
+for deal in deals:
+    sync_deal(deal)
+    time.sleep(RATE_LIMIT_DELAY)
+```
+
+---
+
+## 10. Troubleshooting Guide
+
+### 10.1 Common Issues
+
+#### "Required environment variable not set"
+
+**Cause:** Variable missing from Railway service config
+
+**Fix:** Add variables to SERVICE level (not just project):
+```
+Railway Dashboard → Service → Variables → Add Variable
+```
+
+#### Webhook Timeout Errors in HubSpot
+
+**Cause:** Sync taking >30 seconds
+
+**Fix:** Ensure async processing is working:
+```python
+# Should return 202 Accepted immediately
+thread = threading.Thread(target=sync, daemon=True)
+thread.start()
+return jsonify({"status": "accepted"}), 202
+```
+
+#### "Loan not found in QuantumReverse"
+
+**Causes:**
+1. `loan_id` doesn't exist in QR
+2. API key doesn't have access
+3. Wrong environment (sandbox vs production)
+
+**Diagnosis:**
+```bash
+# Test GUID lookup
+curl https://your-app.up.railway.app/api/admin/test-deal-fetch/123456
+```
+
+#### HubSpot Property Doesn't Exist
+
+**Cause:** Trying to write to non-existent property
+
+**Fix:**
+```bash
+# Check and create missing properties
+curl -X POST https://your-app.up.railway.app/api/admin/verify-hubspot-properties
+```
+
+#### Sync Not Updating Expected Fields
+
+**Diagnosis:**
+```bash
+# See what would be extracted
+curl https://your-app.up.railway.app/api/admin/test-qr-extract/123456
+```
+
+Compare extracted fields with HubSpot properties.
+
+### 10.2 Debug Endpoints
+
+| Endpoint | Use Case |
+|----------|----------|
+| `/api/admin/test-deal-fetch/{id}` | Verify deal can be fetched |
+| `/api/admin/test-qr-extract/{id}` | Preview extracted fields |
+| `/api/admin/raw-qr-data/{id}` | View raw QR API response |
+| `/api/admin/verify-hubspot-properties` | Check property status |
+
+### 10.3 Log Analysis
+
+Check Railway logs for emoji indicators:
+- 📥 Incoming request
+- 📤 Outgoing sync
+- ✅ Success
+- ❌ Error
+- ⏰ Scheduled task
+- 🔍 Lookup operation
+
+```
+Railway Dashboard → Service → Deployments → View Logs
+```
+
+---
+
+## 11. Best Practices
+
+### 11.1 Code Organization
+
+```
+hubspot-qr-integration/
+├── app.py                    # Flask routes only
+├── config.py                 # Environment config
+├── services/                 # Business logic
+│   ├── hubspot.py           # HubSpot API client
+│   ├── quantum_reverse.py   # QR API client + extraction
+│   ├── sync_deals.py        # Deal sync logic
+│   ├── sync_leads.py        # Lead sync logic
+│   ├── sync_contacts.py     # Contact sync logic
+│   └── batch_sync.py        # Batch processing
+└── utils/                    # Utilities
+    ├── date_utils.py        # Date formatting
+    └── logger.py            # Logging setup
+```
+
+### 11.2 Error Handling
+
+```python
+try:
+    result = api_call()
+except requests.exceptions.RequestException as e:
+    logger.error(f"API error: {e}")
+    # Update sync status with error
+    hubspot.update_deal(deal_id, {
+        'quantum_reverse_sync_status': 'error',
+        'quantum_reverse_error_message': str(e)[:500]
+    })
+    return {"success": False, "error": str(e)}
+```
+
+### 11.3 Logging Best Practices
+
+```python
+# Use descriptive logging with context
+logger.info(f"📥 Webhook received: deal_id={deal_id}")
+logger.info(f"✅ Synced {len(fields)} fields for deal {deal_id}")
+logger.error(f"❌ Failed to sync deal {deal_id}: {error}")
+```
+
+### 11.4 Field Extraction Pattern
+
+```python
+def extract_data(loan_data: Dict) -> Dict:
+    result = {}
+    
+    # Always use .get() with defaults
+    value = loan_data.get('Nested', {}).get('Path', {}).get('Value')
+    
+    # Only set if value exists
+    if value is not None:
+        result['hubspot_field'] = value
+    
+    return result
+```
+
+### 11.5 Testing Strategy
+
+1. **Use admin endpoints for debugging:**
+   - `/api/admin/test-qr-extract/{id}` - Preview extractions
+   - `/api/admin/raw-qr-data/{id}` - View raw data
+
+2. **Test sync manually before workflow:**
+   - `POST /api/sync/deal/{id}`
+
+3. **Use dedicated test records:**
+   - Create test deals with known data
+   - Verify all fields sync correctly
+
+---
+
+## 12. Maintenance & Operations
+
+### 12.1 Regular Monitoring
+
+| Check | Frequency | Method |
+|-------|-----------|--------|
+| Health check | Continuous | Railway monitors `/health` |
+| Sync errors | Daily | Check Railway logs |
+| Batch sync completion | Per run | Review logs after each batch |
+| HubSpot workflow errors | Daily | HubSpot workflow history |
+
+### 12.2 Updating the Integration
+
+1. **Make changes locally**
+2. **Test with admin endpoints**
+3. **Push to GitHub:**
+   ```powershell
+   git add -A; git commit -m "Description"; git push
+   ```
+4. **Railway auto-deploys** on push to main
+5. **Monitor logs** for new deploy
+
+### 12.3 Adding New Fields
+
+1. **Add extraction logic** to `quantum_reverse.py`:
+   ```python
+   if data.get('NewField') is not None:
+       result['hubspot_property_name'] = data['NewField']
+   ```
+
+2. **Add property to DEAL_PROPERTIES** in `hubspot.py`
+
+3. **Create property in HubSpot:**
+   ```bash
+   POST /api/admin/verify-hubspot-properties
+   ```
+
+4. **Test extraction:**
+   ```bash
+   GET /api/admin/test-qr-extract/{deal_id}
+   ```
+
+### 12.4 Scaling Considerations
+
+| Factor | Current Setting | When to Adjust |
+|--------|-----------------|----------------|
+| `BATCH_SIZE` | 25 | Increase if rate limits allow |
+| `RATE_LIMIT_DELAY` | 1.0s | Decrease if rate limits allow |
+| `CRON_INTERVAL_MINUTES` | 360 (6h) | Decrease for more frequent sync |
+| Gunicorn workers | 2 | Increase for more traffic |
+
+### 12.5 Disaster Recovery
+
+1. **Code is in GitHub** - Can redeploy anytime
+2. **Configuration in Railway** - Variables saved in service
+3. **Data lives in HubSpot/QR** - Integration is stateless
+4. **To recover:**
+   - Create new Railway service
+   - Connect to same GitHub repo
+   - Copy environment variables
+   - Update HubSpot webhook URLs
+
+---
+
+## Appendix A: Quick Reference
+
+### API Testing Commands
+
+```bash
+# Health check
+curl https://your-app.up.railway.app/health
+
+# Manual deal sync
+curl -X POST https://your-app.up.railway.app/api/sync/deal/123456
+
+# Check batch status
+curl https://your-app.up.railway.app/api/batch/status
+
+# Trigger batch sync
+curl -X POST https://your-app.up.railway.app/api/batch/trigger
+
+# View extracted fields
+curl https://your-app.up.railway.app/api/admin/test-qr-extract/123456
+
+# Check/create properties
+curl -X POST https://your-app.up.railway.app/api/admin/verify-hubspot-properties
+```
+
+### Git Quick Deploy
+
+```powershell
+# Windows PowerShell
+git add -A; git commit -m "Your message"; git push
+
+# Auto-deploys to Railway on push
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `app.py` | Flask routes, webhook handlers |
+| `config.py` | Environment configuration |
+| `services/quantum_reverse.py` | QR API + 10 extraction methods |
+| `services/hubspot.py` | HubSpot API + property management |
+| `services/sync_deals.py` | Deal sync orchestration |
+
+---
+
+## Document History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0.0 | Dec 2024 | Initial integration |
+| 2.0.0 | Jan 5, 2026 | Added 102 new properties, UAT feedback resolution |
+
+---
+
+*This document consolidates all integration knowledge, lessons learned, and operational procedures for the HubSpot-QuantumReverse integration project.*
+
+
+

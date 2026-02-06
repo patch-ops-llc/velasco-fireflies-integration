@@ -434,6 +434,97 @@ class DealCloudClient:
             logger.error(f"Interaction creation failed: {str(e)}", e)
             return None
     
+    def update_interaction(
+        self,
+        entry_id: int,
+        notes: str,
+        contact_ids: Optional[List[int]] = None,
+        company_id: Optional[int] = None,
+        deal_ids: Optional[List[int]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Update an existing interaction in DealCloud (e.g. to backfill notes
+        that were not yet available when the interaction was first created).
+        
+        Args:
+            entry_id: The EntryId of the existing interaction to update
+            notes: Updated notes/content
+            contact_ids: Optional updated list of contact IDs
+            company_id: Optional updated company ID
+            deal_ids: Optional updated list of deal IDs
+            
+        Returns:
+            Updated interaction data or None
+        """
+        self._delay()
+        
+        logger.interaction(f"Updating interaction (ID: {entry_id})")
+        
+        payload = [{
+            "EntryId": entry_id,
+            "Notes": notes
+        }]
+        
+        if contact_ids is not None:
+            payload[0]["Contacts"] = contact_ids
+        
+        if company_id is not None:
+            payload[0]["Companies"] = [company_id]
+        
+        if deal_ids is not None:
+            payload[0]["Deals"] = deal_ids
+        
+        logger.debug(f"Update payload:")
+        logger.debug(f"  EntryId: {entry_id}")
+        logger.debug(f"  Notes length: {len(notes)} chars")
+        if contact_ids is not None:
+            logger.debug(f"  Contacts: {contact_ids}")
+        if company_id is not None:
+            logger.debug(f"  Companies: {[company_id]}")
+        if deal_ids is not None:
+            logger.debug(f"  Deals: {deal_ids}")
+        
+        try:
+            response = self.session.put(
+                url=f"{self.base_url}/api/rest/v4/data/entrydata/rows/{config.INTERACTION_ENTRY_TYPE_ID}",
+                params={"unflatten": "yes"},
+                headers=self._get_headers(),
+                json=payload,
+                timeout=self.timeout
+            )
+            
+            if self._handle_rate_limit(response):
+                return self.update_interaction(entry_id, notes, contact_ids, company_id, deal_ids)
+            
+            logger.debug(f"Update response status: {response.status_code}")
+            
+            if not response.ok:
+                logger.error(f"Interaction update error: {response.status_code}")
+                logger.error(f"Response body: {response.text[:500]}")
+                return None
+            
+            data = response.json()
+            result = data[0] if isinstance(data, list) and data else data
+            
+            result_id = result.get("EntryId")
+            
+            if result_id == -1 or result.get("Errors"):
+                errors = result.get("Errors", [])
+                error_desc = ", ".join([f"{e.get('field')}: {e.get('description')}" for e in errors])
+                logger.error(f"Interaction update failed: {error_desc}")
+                return None
+            
+            logger.success(f"Interaction updated (ID: {result_id}) - Notes: {len(notes)} chars")
+            
+            return {
+                "EntryId": result_id,
+                "NotesLength": len(notes)
+            }
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Interaction update failed: {str(e)}", e)
+            return None
+    
     # ==================== Deal Operations ====================
     
     def search_deals_by_company(self, company_id: int) -> List[Dict[str, Any]]:

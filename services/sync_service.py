@@ -111,6 +111,34 @@ class SyncService:
         
         return None
     
+    def _has_incomplete_notes(self, notes: str) -> bool:
+        """
+        Detect if interaction notes are incomplete (missing Fireflies summary data).
+        
+        This happens when Fireflies hasn't finished processing the transcript at the 
+        time the interaction was first created. The interaction gets the basic header 
+        (date, duration, participants) but no summary, detailed notes, or action items.
+        
+        Args:
+            notes: The existing interaction's Notes field
+            
+        Returns:
+            True if the notes appear incomplete and should be updated
+        """
+        if not notes or not notes.strip():
+            return True
+        
+        # These markers indicate that full Fireflies summary content was included
+        content_markers = ["SUMMARY:", "DETAILED NOTES:", "ACTION ITEMS:", "KEY TOPICS:", "NOTES:", "OUTLINE:"]
+        
+        has_any_content = any(marker in notes for marker in content_markers)
+        
+        if not has_any_content:
+            logger.debug(f"Notes appear incomplete - no content markers found (length: {len(notes)} chars)")
+            return True
+        
+        return False
+    
     def format_content(self, summary: Optional[Dict[str, Any]]) -> str:
         """
         Format Fireflies summary, detailed notes, and action items.
@@ -396,19 +424,70 @@ class SyncService:
             
             if existing:
                 entry_id = existing.get("EntryId")
-                logger.info(f"Interaction already exists (ID: {entry_id}) - SKIPPING")
+                existing_notes = existing.get("Notes") or ""
                 
-                return SyncResult(
-                    transcript_id=transcript_id,
-                    transcript_title=title,
-                    status="skipped",
-                    reason="Interaction already exists",
-                    interaction_id=entry_id,
-                    company_id=final_company_id,
-                    contact_ids=contact_ids,
-                    deal_ids=deal_ids,
-                    created_contacts=created_contacts
-                )
+                # Detect if the existing interaction has incomplete notes
+                # (created before Fireflies finished processing the summary)
+                notes_incomplete = self._has_incomplete_notes(existing_notes)
+                has_new_content = bool(content)  # Fireflies now has summary data
+                
+                if notes_incomplete and has_new_content:
+                    logger.warning(f"Interaction exists (ID: {entry_id}) but notes are INCOMPLETE - updating with full content")
+                    logger.info(f"  Existing notes length: {len(existing_notes)} chars")
+                    logger.info(f"  New notes length: {len(interaction_notes)} chars")
+                    
+                    update_result = dealcloud_client.update_interaction(
+                        entry_id=entry_id,
+                        notes=interaction_notes,
+                        contact_ids=contact_ids if contact_ids else None,
+                        company_id=final_company_id if final_company_id else None,
+                        deal_ids=deal_ids if deal_ids else None
+                    )
+                    
+                    if update_result:
+                        logger.success(f"Interaction updated with full notes (ID: {entry_id})")
+                        return SyncResult(
+                            transcript_id=transcript_id,
+                            transcript_title=title,
+                            status="updated",
+                            reason="Notes backfilled (Fireflies summary now available)",
+                            interaction_id=entry_id,
+                            company_id=final_company_id,
+                            contact_ids=contact_ids,
+                            deal_ids=deal_ids,
+                            found_contacts=found_contacts,
+                            created_contacts=created_contacts,
+                            found_deals=found_deals
+                        )
+                    else:
+                        logger.error(f"Failed to update interaction (ID: {entry_id})")
+                        return SyncResult(
+                            transcript_id=transcript_id,
+                            transcript_title=title,
+                            status="error",
+                            error="Failed to update interaction with backfilled notes",
+                            interaction_id=entry_id,
+                            company_id=final_company_id,
+                            contact_ids=contact_ids,
+                            deal_ids=deal_ids
+                        )
+                else:
+                    if not notes_incomplete:
+                        logger.info(f"Interaction already exists with complete notes (ID: {entry_id}) - SKIPPING")
+                    else:
+                        logger.info(f"Interaction exists (ID: {entry_id}), notes incomplete but Fireflies still has no summary - SKIPPING")
+                    
+                    return SyncResult(
+                        transcript_id=transcript_id,
+                        transcript_title=title,
+                        status="skipped",
+                        reason="Interaction already exists" if not notes_incomplete else "Interaction exists, Fireflies summary still pending",
+                        interaction_id=entry_id,
+                        company_id=final_company_id,
+                        contact_ids=contact_ids,
+                        deal_ids=deal_ids,
+                        created_contacts=created_contacts
+                    )
             
             # Create new interaction
             logger.interaction("Creating new interaction in DealCloud...")
@@ -513,6 +592,7 @@ class SyncService:
         # Calculate stats
         duration = (datetime.now() - start_time).total_seconds()
         created_count = sum(1 for r in results if r["status"] == "created")
+        updated_count = sum(1 for r in results if r["status"] == "updated")
         skipped_count = sum(1 for r in results if r["status"] == "skipped")
         error_count = sum(1 for r in results if r["status"] == "error")
         contacts_created = sum(len(r.get("created_contacts", [])) for r in results)
@@ -522,6 +602,8 @@ class SyncService:
         logger.separator("=", 60)
         logger.info(f"Total processed: {len(results)}")
         logger.success(f"Created: {created_count}")
+        if updated_count:
+            logger.success(f"Updated (notes backfilled): {updated_count}")
         logger.info(f"Skipped: {skipped_count}")
         if error_count:
             logger.error(f"Errors: {error_count}")
@@ -535,6 +617,7 @@ class SyncService:
             "transcripts_limit": limit or "default",
             "processed_count": len(results),
             "created_count": created_count,
+            "updated_count": updated_count,
             "skipped_count": skipped_count,
             "error_count": error_count,
             "contacts_created": contacts_created,

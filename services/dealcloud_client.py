@@ -331,7 +331,7 @@ class DealCloudClient:
         subject: str,
         notes: str,
         contact_ids: List[int],
-        company_id: Optional[int] = None,
+        company_ids: Optional[List[int]] = None,
         deal_ids: Optional[List[int]] = None
     ) -> Optional[Dict[str, Any]]:
         """
@@ -341,7 +341,7 @@ class DealCloudClient:
             subject: Interaction subject
             notes: Interaction notes/content
             contact_ids: List of contact IDs to associate
-            company_id: Optional company ID
+            company_ids: Optional list of company IDs (e.g., both the bank and the project company)
             deal_ids: Optional list of deal IDs
             
         Returns:
@@ -364,8 +364,8 @@ class DealCloudClient:
             "Type": config.INTERACTION_TYPE_ID
         }]
         
-        if company_id:
-            payload[0]["Companies"] = [company_id]
+        if company_ids:
+            payload[0]["Companies"] = company_ids
         
         if deal_ids:
             payload[0]["Deals"] = deal_ids
@@ -389,7 +389,7 @@ class DealCloudClient:
             )
             
             if self._handle_rate_limit(response):
-                return self.create_interaction(subject, notes, contact_ids, company_id, deal_ids)
+                return self.create_interaction(subject, notes, contact_ids, company_ids, deal_ids)
             
             logger.debug(f"Response status: {response.status_code}")
             
@@ -425,7 +425,7 @@ class DealCloudClient:
                 "EntryId": entry_id,
                 "Subject": subject,
                 "ContactIds": contact_ids,
-                "CompanyId": company_id,
+                "CompanyIds": company_ids or [],
                 "DealIds": deal_ids,
                 "NotesLength": len(notes)
             }
@@ -439,7 +439,7 @@ class DealCloudClient:
         entry_id: int,
         notes: str,
         contact_ids: Optional[List[int]] = None,
-        company_id: Optional[int] = None,
+        company_ids: Optional[List[int]] = None,
         deal_ids: Optional[List[int]] = None
     ) -> Optional[Dict[str, Any]]:
         """
@@ -450,7 +450,7 @@ class DealCloudClient:
             entry_id: The EntryId of the existing interaction to update
             notes: Updated notes/content
             contact_ids: Optional updated list of contact IDs
-            company_id: Optional updated company ID
+            company_ids: Optional updated list of company IDs (bank + project company)
             deal_ids: Optional updated list of deal IDs
             
         Returns:
@@ -468,8 +468,8 @@ class DealCloudClient:
         if contact_ids is not None:
             payload[0]["Contacts"] = contact_ids
         
-        if company_id is not None:
-            payload[0]["Companies"] = [company_id]
+        if company_ids is not None:
+            payload[0]["Companies"] = company_ids
         
         if deal_ids is not None:
             payload[0]["Deals"] = deal_ids
@@ -479,8 +479,8 @@ class DealCloudClient:
         logger.debug(f"  Notes length: {len(notes)} chars")
         if contact_ids is not None:
             logger.debug(f"  Contacts: {contact_ids}")
-        if company_id is not None:
-            logger.debug(f"  Companies: {[company_id]}")
+        if company_ids is not None:
+            logger.debug(f"  Companies: {company_ids}")
         if deal_ids is not None:
             logger.debug(f"  Deals: {deal_ids}")
         
@@ -494,7 +494,7 @@ class DealCloudClient:
             )
             
             if self._handle_rate_limit(response):
-                return self.update_interaction(entry_id, notes, contact_ids, company_id, deal_ids)
+                return self.update_interaction(entry_id, notes, contact_ids, company_ids, deal_ids)
             
             logger.debug(f"Update response status: {response.status_code}")
             

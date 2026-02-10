@@ -19,7 +19,7 @@ class SyncResult:
     status: str  # created, skipped, error
     reason: Optional[str] = None
     interaction_id: Optional[int] = None
-    company_id: Optional[int] = None
+    company_ids: List[int] = field(default_factory=list)
     contact_ids: List[int] = field(default_factory=list)
     deal_ids: List[int] = field(default_factory=list)
     found_contacts: List[Dict] = field(default_factory=list)
@@ -34,7 +34,7 @@ class SyncResult:
             "status": self.status,
             "reason": self.reason,
             "interaction_id": self.interaction_id,
-            "company_id": self.company_id,
+            "company_ids": self.company_ids,
             "contact_ids": self.contact_ids,
             "deal_ids": self.deal_ids,
             "found_contacts": self.found_contacts,
@@ -367,14 +367,21 @@ class SyncService:
             elif not deal_ids:
                 logger.info("No deals found (no project name extracted and no company)")
             
-            # Use target company from deal if found, otherwise use banker's company
-            # This ensures Project Rubicon links to NEC Inc., not Crutchfield Capital
-            final_company_id = target_company_id if target_company_id else company_id
+            # Collect ALL relevant company IDs — both the investment bank (from contacts)
+            # and the target/project company (from the deal). This ensures the interaction
+            # is associated with both the bank and the project company.
+            company_ids = []
+            if target_company_id:
+                company_ids.append(target_company_id)
+                logger.company(f"Including deal's target company: {target_company_name} (ID: {target_company_id})")
+            if company_id and company_id not in company_ids:
+                company_ids.append(company_id)
+                logger.company(f"Including contact's company (bank): ID {company_id}")
             if target_company_id and company_id and target_company_id != company_id:
-                logger.company(f"Using deal's target company ({target_company_name}) instead of contact's company")
+                logger.company(f"Interaction will be linked to BOTH the project company ({target_company_name}) and the investment bank")
             
             # Now check if we have enough to create an interaction
-            if not final_company_id and not contact_ids and not deal_ids:
+            if not company_ids and not contact_ids and not deal_ids:
                 logger.warning("SKIPPED: No company, no contacts, and no deals found")
                 return SyncResult(
                     transcript_id=transcript_id,
@@ -440,7 +447,7 @@ class SyncService:
                         entry_id=entry_id,
                         notes=interaction_notes,
                         contact_ids=contact_ids if contact_ids else None,
-                        company_id=final_company_id if final_company_id else None,
+                        company_ids=company_ids if company_ids else None,
                         deal_ids=deal_ids if deal_ids else None
                     )
                     
@@ -452,7 +459,7 @@ class SyncService:
                             status="updated",
                             reason="Notes backfilled (Fireflies summary now available)",
                             interaction_id=entry_id,
-                            company_id=final_company_id,
+                            company_ids=company_ids,
                             contact_ids=contact_ids,
                             deal_ids=deal_ids,
                             found_contacts=found_contacts,
@@ -467,7 +474,7 @@ class SyncService:
                             status="error",
                             error="Failed to update interaction with backfilled notes",
                             interaction_id=entry_id,
-                            company_id=final_company_id,
+                            company_ids=company_ids,
                             contact_ids=contact_ids,
                             deal_ids=deal_ids
                         )
@@ -483,7 +490,7 @@ class SyncService:
                         status="skipped",
                         reason="Interaction already exists" if not notes_incomplete else "Interaction exists, Fireflies summary still pending",
                         interaction_id=entry_id,
-                        company_id=final_company_id,
+                        company_ids=company_ids,
                         contact_ids=contact_ids,
                         deal_ids=deal_ids,
                         created_contacts=created_contacts
@@ -492,7 +499,7 @@ class SyncService:
             # Create new interaction
             logger.interaction("Creating new interaction in DealCloud...")
             logger.interaction(f"  Subject: {interaction_subject}")
-            logger.interaction(f"  Company ID: {final_company_id}")
+            logger.interaction(f"  Company IDs: {company_ids}")
             logger.interaction(f"  Contact IDs: {contact_ids}")
             logger.interaction(f"  Deal IDs: {deal_ids}")
             logger.interaction(f"  Notes length: {len(interaction_notes)} chars")
@@ -501,13 +508,13 @@ class SyncService:
                 subject=interaction_subject,
                 notes=interaction_notes,
                 contact_ids=contact_ids,
-                company_id=final_company_id,
+                company_ids=company_ids if company_ids else None,
                 deal_ids=deal_ids
             )
             
             if result:
                 logger.success(f"Interaction created (ID: {result.get('EntryId')})")
-                logger.success(f"  Linked to company: {final_company_id}")
+                logger.success(f"  Linked to companies: {company_ids}")
                 logger.success(f"  Linked to deals: {deal_ids}")
                 
                 return SyncResult(
@@ -515,7 +522,7 @@ class SyncService:
                     transcript_title=title,
                     status="created",
                     interaction_id=result.get("EntryId"),
-                    company_id=final_company_id,
+                    company_ids=company_ids,
                     contact_ids=contact_ids,
                     deal_ids=deal_ids,
                     found_contacts=found_contacts,
@@ -528,7 +535,7 @@ class SyncService:
                     transcript_title=title,
                     status="error",
                     error="Failed to create interaction",
-                    company_id=final_company_id,
+                    company_ids=company_ids,
                     created_contacts=created_contacts
                 )
             
